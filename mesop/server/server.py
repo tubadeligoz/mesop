@@ -4,6 +4,7 @@ import secrets
 import threading
 import types
 from typing import Generator, Sequence
+from concurrent.futures import ThreadPoolExecutor  # ADDED: For Thread Pool implementation
 
 from flask import (
   Flask,
@@ -44,6 +45,21 @@ from mesop.warn import warn
 UI_PATH = prefix_base_url("/__ui__")
 
 logger = logging.getLogger(__name__)
+
+# =========================================================================
+# SECURITY PATCH: CWE-400 (Uncontrolled Resource Consumption) Mitigation
+# =========================================================================
+# Setting global limits to prevent the server from crashing (OOM) either 
+# horizontally (thousands of connections) or vertically (spam from a single connection).
+
+# 1. GLOBAL THREAD POOL: The maximum number of threads that can run concurrently in the OS.
+MAX_GLOBAL_THREADS = 100 
+global_executor = ThreadPoolExecutor(max_workers=MAX_GLOBAL_THREADS)
+
+# 2. GLOBAL BACKPRESSURE: The maximum task queue to be held in RAM even if the pool is full.
+MAX_QUEUE_SIZE = 500
+global_semaphore = threading.BoundedSemaphore(MAX_QUEUE_SIZE)
+# =========================================================================
 
 
 def _process_on_load_result(result) -> Generator[None, None, None]:
@@ -349,21 +365,14 @@ def configure_flask_app(
         ws.close(message="Rejecting cross-site WebSocket request to " + UI_PATH)
         return
 
-      # Limit the number of threads that can be spawned per WebSocket connection
-      # to prevent uncontrolled resource consumption (CWE-400). Normal UI interactions
-      # rarely require more than 1-2 concurrent in-flight requests; this cap is
-      # generous for legitimate use while making flooding impractical.
-      _MAX_CONCURRENT_THREADS = 8
-      _semaphore = threading.BoundedSemaphore(_MAX_CONCURRENT_THREADS)
-
-      def ws_generate_data(ws, ui_request):
+      def ws_generate_data(ws_conn, req):
         try:
-          for data_chunk in generate_data(ui_request):
-            if not ws.connected:
+          for data_chunk in generate_data(req):
+            if not ws_conn.connected:
               break
-            ws.send(data_chunk)
-        finally:
-          _semaphore.release()
+            ws_conn.send(data_chunk)
+        except Exception as e:
+           logging.error("WebSocket data generation error: %s", e)
 
       # Generate a unique session ID for the WebSocket connection
       session_id = secrets.token_urlsafe(32)
@@ -383,25 +392,37 @@ def configure_flask_app(
             logging.error("Failed to parse message: %s", parse_error)
             continue  # Skip processing this message
 
-          # Drop the message if this connection already has too many threads running.
-          if not _semaphore.acquire(blocking=False):
-            logging.warning(
-              "WebSocket connection exceeded max concurrent requests (%d), dropping message.",
-              _MAX_CONCURRENT_THREADS,
-            )
-            continue
+          # =========================================================================
+          # VULNERABILITY FIX: Thread Limits and Worker Pool Integration
+          # =========================================================================
+          
+          # 1. FAIL-FAST (RAPID DROP CONTROL)
+          # If the number of pending tasks in the system exceeds MAX_QUEUE_SIZE,
+          # silently drop the incoming request to prevent server exhaustion (OOM).
+          if not global_semaphore.acquire(blocking=False):
+              logging.warning(
+                  "Server capacity reached (DDoS Protection active). Client request dropped. Session: %s", 
+                  session_id
+              )
+              continue # Skip the request
+              
+          # 2. SAFE TASK WRAPPER
+          # Ensures that the semaphore lock is reliably released whether the task
+          # submitted to the pool succeeds or crashes (Prevents Semaphore Leaks).
+          def safe_task_wrapper(websocket_conn, request_data):
+              try:
+                  ws_generate_data(websocket_conn, request_data)
+              finally:
+                  global_semaphore.release()
 
-          # Start a new thread so we can handle multiple
-          # concurrent updates for the same websocket connection.
-          #
-          # Note: we do copy_current_request_context at the callsite
-          # to ensure that the request context is copied over for each new thread.
-          thread = threading.Thread(
-            target=copy_current_request_context(ws_generate_data),
-            args=(ws, ui_request),
-            daemon=True,
-          )
-          thread.start()
+          # 3. CONTEXT PROPAGATION AND POOL SUBMISSION
+          # We wrap the safe task with Flask's copy_current_request_context so the
+          # background thread maintains awareness of the current request context.
+          # Then, instead of spawning a new unbounded thread (threading.Thread().start()),
+          # we submit the task directly to our Global Thread Pool.
+          context_aware_task = copy_current_request_context(safe_task_wrapper)
+          global_executor.submit(context_aware_task, ws, ui_request)
+          # =========================================================================
 
       except Exception as e:
         logging.error("WebSocket error: %s", e)
